@@ -15,6 +15,7 @@ module.exports = {
   swissephPath: (process.env.SWISSEPH_PATH || "").trim(),
   googleMapsApiKey: (process.env.GOOGLE_MAPS_API_KEY || "").trim(),
   openCageApiKey: (process.env.OPENCAGE_API_KEY || "").trim(),
+  brandLogoUrl: (process.env.BRAND_LOGO_URL || "").trim(),
   kervinCalendlyUrl: (process.env.KERVIN_CALENDLY_URL || "https://calendly.com/kervinheart").trim(),
   kervinUserId: (process.env.KERVIN_USER_ID || "").trim(),
   enableMessageContentIntent: (process.env.ENABLE_MESSAGE_CONTENT_INTENT || "false").trim().toLowerCase() === "true"

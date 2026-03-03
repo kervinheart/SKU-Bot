@@ -84,11 +84,16 @@ const PLANET_IDS = {
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^\d{2}:\d{2}$/;
 const LAT_LONG_RE = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/;
+const LAT_LONG_CARDINAL_RE = /^\s*([+-]?\d+(?:\.\d+)?)\s*°?\s*([NnSs])?\s*,\s*([+-]?\d+(?:\.\d+)?)\s*°?\s*([EeWw])?\s*$/;
 const LOCAL_LOCATION_FALLBACKS = {
   "fort pierce, fl": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 },
   "fort pierce, florida": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 },
   "ft pierce, fl": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 },
-  "ft pierce, florida": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 }
+  "ft pierce, florida": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 },
+  "fort pierce south, fl": { displayName: "Fort Pierce South, Florida, United States", latitude: 27.3848, longitude: -80.3473 },
+  "fort pierce south, florida": { displayName: "Fort Pierce South, Florida, United States", latitude: 27.3848, longitude: -80.3473 },
+  "fort pierce south fl": { displayName: "Fort Pierce South, Florida, United States", latitude: 27.3848, longitude: -80.3473 },
+  "fort pierce fl": { displayName: "Fort Pierce, Florida, United States", latitude: 27.4467, longitude: -80.3256 }
 };
 
 function escapeHtml(value) {
@@ -154,12 +159,29 @@ function parseTime(timeText) {
 
 function parseLatLong(locationInput) {
   const match = LAT_LONG_RE.exec(locationInput);
-  if (!match) {
+  const cardinalMatch = LAT_LONG_CARDINAL_RE.exec(locationInput);
+  if (!match && !cardinalMatch) {
     return null;
   }
 
-  const latitude = Number.parseFloat(match[1]);
-  const longitude = Number.parseFloat(match[2]);
+  let latitude;
+  let longitude;
+  if (match) {
+    latitude = Number.parseFloat(match[1]);
+    longitude = Number.parseFloat(match[2]);
+  } else {
+    latitude = Number.parseFloat(cardinalMatch[1]);
+    longitude = Number.parseFloat(cardinalMatch[3]);
+    const latCardinal = (cardinalMatch[2] || "").toUpperCase();
+    const lonCardinal = (cardinalMatch[4] || "").toUpperCase();
+
+    if (latCardinal === "N" || latCardinal === "S") {
+      latitude = Math.abs(latitude) * (latCardinal === "S" ? -1 : 1);
+    }
+    if (lonCardinal === "E" || lonCardinal === "W") {
+      longitude = Math.abs(longitude) * (lonCardinal === "W" ? -1 : 1);
+    }
+  }
 
   if (latitude < -90 || latitude > 90) {
     throw new Error("Latitude must be between -90 and 90.");
@@ -172,20 +194,102 @@ function parseLatLong(locationInput) {
   return { latitude, longitude };
 }
 
-async function geocodeCity(locationInput, userAgent) {
-  const nominatimResult = await geocodeWithNominatim(locationInput, userAgent);
-  if (nominatimResult) {
-    return nominatimResult;
+function normalizeLocationLookupKey(locationInput) {
+  return (locationInput || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^ft\b/, "fort")
+    .replace(/\s*,\s*/g, ",")
+    .replace(/,\s*/g, ", ");
+}
+
+function buildLocationQueryVariants(locationInput) {
+  const base = (locationInput || "").trim();
+  if (!base) {
+    return [];
   }
 
-  const openMeteoResult = await geocodeWithOpenMeteo(locationInput);
-  if (openMeteoResult) {
-    return openMeteoResult;
+  const variants = new Set([base]);
+  const normalized = base.replace(/\s+/g, " ").trim();
+  variants.add(normalized);
+
+  const hasCountry = /\b(usa|united states|us)\b/i.test(base);
+  const looksLikeUsCityState = /,\s*[A-Za-z]{2}$/.test(base) || /,\s*[A-Za-z\s]+,\s*[A-Za-z]{2}$/.test(base);
+  if (!hasCountry && looksLikeUsCityState) {
+    variants.add(`${normalized}, USA`);
+    variants.add(`${normalized}, United States`);
   }
 
+  if (!hasCountry && !normalized.includes(",")) {
+    variants.add(`${normalized}, USA`);
+  }
+
+  return [...variants];
+}
+
+async function fetchJsonWithRetry(url, options = {}, retries = 2, timeoutMs = 10000) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!response.ok) {
+        if (attempt === retries) {
+          return null;
+        }
+        continue;
+      }
+
+      return await response.json();
+    } catch (error) {
+      clearTimeout(timeout);
+      if (attempt === retries) {
+        return null;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function geocodeCity(locationInput, userAgent, openCageApiKey = "", googleMapsApiKey = "") {
   const localFallback = geocodeFromLocalFallback(locationInput);
   if (localFallback) {
     return localFallback;
+  }
+
+  const variants = buildLocationQueryVariants(locationInput);
+  for (const query of variants) {
+    const nominatimResult = await geocodeWithNominatim(query, userAgent);
+    if (nominatimResult) {
+      return nominatimResult;
+    }
+
+    const mapsCoResult = await geocodeWithMapsCo(query);
+    if (mapsCoResult) {
+      return mapsCoResult;
+    }
+
+    const openCageResult = await geocodeWithOpenCage(query, openCageApiKey);
+    if (openCageResult) {
+      return openCageResult;
+    }
+
+    const googleResult = await geocodeWithGoogle(query, googleMapsApiKey);
+    if (googleResult) {
+      return googleResult;
+    }
+
+    const openMeteoResult = await geocodeWithOpenMeteo(query);
+    if (openMeteoResult) {
+      return openMeteoResult;
+    }
   }
 
   throw new Error("Unknown location or lookup service unavailable. Try a more specific city/state or use lat,long (example: 27.4467,-80.3256).");
@@ -197,23 +301,12 @@ async function geocodeWithNominatim(locationInput, userAgent) {
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("limit", "1");
 
-  let response;
-  try {
-    response = await fetch(url, {
-      headers: {
-        "User-Agent": userAgent || "SKUOwlBirthchartBot/1.0",
-        Accept: "application/json"
-      }
-    });
-  } catch (error) {
-    return null;
-  }
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const results = await response.json();
+  const results = await fetchJsonWithRetry(url, {
+    headers: {
+      "User-Agent": userAgent || "SKUOwlBirthchartBot/1.0",
+      Accept: "application/json"
+    }
+  });
   if (!Array.isArray(results) || results.length === 0) {
     return null;
   }
@@ -233,20 +326,9 @@ async function geocodeWithOpenMeteo(locationInput) {
   url.searchParams.set("language", "en");
   url.searchParams.set("format", "json");
 
-  let response;
-  try {
-    response = await fetch(url, {
-      headers: { Accept: "application/json" }
-    });
-  } catch (error) {
-    return null;
-  }
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const payload = await response.json();
+  const payload = await fetchJsonWithRetry(url, {
+    headers: { Accept: "application/json" }
+  });
   if (!payload || !Array.isArray(payload.results) || payload.results.length === 0) {
     return null;
   }
@@ -261,16 +343,95 @@ async function geocodeWithOpenMeteo(locationInput) {
   };
 }
 
-function geocodeFromLocalFallback(locationInput) {
-  const key = (locationInput || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
+async function geocodeWithMapsCo(locationInput) {
+  const url = new URL("https://geocode.maps.co/search");
+  url.searchParams.set("q", locationInput);
+  url.searchParams.set("limit", "1");
 
-  return LOCAL_LOCATION_FALLBACKS[key] || null;
+  const payload = await fetchJsonWithRetry(url, {
+    headers: { Accept: "application/json" }
+  });
+  if (!Array.isArray(payload) || payload.length === 0) {
+    return null;
+  }
+
+  const first = payload[0];
+  if (!first || first.lat == null || first.lon == null) {
+    return null;
+  }
+
+  return {
+    displayName: first.display_name || locationInput,
+    latitude: Number.parseFloat(first.lat),
+    longitude: Number.parseFloat(first.lon)
+  };
 }
 
-async function resolveLocation(locationInput, userAgent) {
+async function geocodeWithOpenCage(locationInput, openCageApiKey) {
+  if (!openCageApiKey) {
+    return null;
+  }
+
+  const url = new URL("https://api.opencagedata.com/geocode/v1/json");
+  url.searchParams.set("q", locationInput);
+  url.searchParams.set("key", openCageApiKey);
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("language", "en");
+  url.searchParams.set("no_annotations", "1");
+
+  const payload = await fetchJsonWithRetry(url, {
+    headers: { Accept: "application/json" }
+  });
+  if (!payload || !Array.isArray(payload.results) || payload.results.length === 0) {
+    return null;
+  }
+
+  const first = payload.results[0];
+  if (!first.geometry) {
+    return null;
+  }
+
+  return {
+    displayName: first.formatted || locationInput,
+    latitude: Number.parseFloat(first.geometry.lat),
+    longitude: Number.parseFloat(first.geometry.lng)
+  };
+}
+
+async function geocodeWithGoogle(locationInput, googleMapsApiKey) {
+  if (!googleMapsApiKey) {
+    return null;
+  }
+
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set("address", locationInput);
+  url.searchParams.set("key", googleMapsApiKey);
+
+  const payload = await fetchJsonWithRetry(url, {
+    headers: { Accept: "application/json" }
+  });
+  if (!payload || !Array.isArray(payload.results) || payload.results.length === 0) {
+    return null;
+  }
+
+  const first = payload.results[0];
+  if (!first.geometry || !first.geometry.location) {
+    return null;
+  }
+
+  return {
+    displayName: first.formatted_address || locationInput,
+    latitude: Number.parseFloat(first.geometry.location.lat),
+    longitude: Number.parseFloat(first.geometry.location.lng)
+  };
+}
+
+function geocodeFromLocalFallback(locationInput) {
+  const key = normalizeLocationLookupKey(locationInput);
+  return LOCAL_LOCATION_FALLBACKS[key] || LOCAL_LOCATION_FALLBACKS[key.replace(",", "")] || null;
+}
+
+async function resolveLocation(locationInput, userAgent, openCageApiKey = "", googleMapsApiKey = "") {
   const trimmed = (locationInput || "").trim();
   if (!trimmed) {
     throw new Error("`location` is required. Use city/state or lat,long.");
@@ -285,7 +446,7 @@ async function resolveLocation(locationInput, userAgent) {
     };
   }
 
-  return geocodeCity(trimmed, userAgent);
+  return geocodeCity(trimmed, userAgent, openCageApiKey, googleMapsApiKey);
 }
 
 function resolveTimezone(latitude, longitude) {
@@ -299,6 +460,41 @@ function resolveTimezone(latitude, longitude) {
   } catch (error) {
     throw new Error("Could not determine timezone for that location. Try a nearby city or lat,long.");
   }
+}
+
+function resolveTimezoneOverride(timezoneOverride, latitude, longitude) {
+  const override = (timezoneOverride || "").trim();
+  if (!override) {
+    return {
+      timezoneName: resolveTimezone(latitude, longitude),
+      warning: null
+    };
+  }
+
+  try {
+    Temporal.ZonedDateTime.from({
+      year: 2026,
+      month: 1,
+      day: 1,
+      hour: 12,
+      minute: 0,
+      second: 0,
+      millisecond: 0,
+      microsecond: 0,
+      nanosecond: 0,
+      timeZone: override
+    }, { disambiguation: "compatible" });
+  } catch (error) {
+    return {
+      timezoneName: resolveTimezone(latitude, longitude),
+      warning: "`timezone` override was invalid, so I used timezone from location."
+    };
+  }
+
+  return {
+    timezoneName: override,
+    warning: null
+  };
 }
 
 function resolveUtcDate(dateText, timeText, timezoneName) {
@@ -439,13 +635,20 @@ function houseForWholeSign(longitude, ascendantLongitude) {
 
 function getPlanetLongitude(julianDayUT, planetId, flags) {
   const result = swisseph.swe_calc_ut(julianDayUT, planetId, flags);
-  if (!result || result.error) {
+  if (result && !result.error) {
+    return normalizeLongitude(result.longitude);
+  }
+
+  // Fallback if Swiss ephemeris files are missing on host.
+  const fallbackFlags = (flags | swisseph.SEFLG_MOSEPH) & ~swisseph.SEFLG_SWIEPH;
+  const fallback = swisseph.swe_calc_ut(julianDayUT, planetId, fallbackFlags);
+  if (!fallback || fallback.error) {
     throw new Error(result && result.error
       ? `Planet calculation failed: ${result.error}`
       : "Planet calculation failed.");
   }
 
-  return normalizeLongitude(result.longitude);
+  return normalizeLongitude(fallback.longitude);
 }
 
 function getHouseData(julianDayUT, latitude, longitude, system) {
@@ -472,7 +675,7 @@ function normalizeSystem(system) {
 }
 
 function normalizeHouseSystem(houseSystem) {
-  const normalized = (houseSystem || "whole_sign").trim().toLowerCase();
+  const normalized = (houseSystem || "placidus").trim().toLowerCase();
   if (normalized !== "whole_sign" && normalized !== "placidus") {
     throw new Error("`house_system` must be `whole_sign` or `placidus`.");
   }
@@ -495,16 +698,30 @@ async function calculateBirthchart({
   time,
   location,
   system = "tropical",
-  houseSystem = "whole_sign",
+  houseSystem = "placidus",
+  timezoneOverride = "",
   nominatimUserAgent = "SKUOwlBirthchartBot/1.0",
+  googleMapsApiKey = "",
+  openCageApiKey = "",
   swissephPath = ""
 }) {
   const normalizedSystem = normalizeSystem(system);
   const normalizedHouseSystem = normalizeHouseSystem(houseSystem);
 
-  const resolvedLocation = await resolveLocation(location, nominatimUserAgent);
-  const timezoneName = resolveTimezone(resolvedLocation.latitude, resolvedLocation.longitude);
+  const resolvedLocation = await resolveLocation(
+    location,
+    nominatimUserAgent,
+    openCageApiKey,
+    googleMapsApiKey
+  );
+  const timezoneResolved = resolveTimezoneOverride(
+    timezoneOverride,
+    resolvedLocation.latitude,
+    resolvedLocation.longitude
+  );
+  const timezoneName = timezoneResolved.timezoneName;
   const { utcDate, timezoneNote } = resolveUtcDate(date, time, timezoneName);
+  const finalTimezoneNote = [timezoneResolved.warning, timezoneNote].filter(Boolean).join(" ") || null;
 
   if (swissephPath) {
     swisseph.swe_set_ephe_path(swissephPath);
@@ -514,7 +731,7 @@ async function calculateBirthchart({
     swisseph.swe_set_sid_mode(swisseph.SE_SIDM_LAHIRI, 0, 0);
   }
 
-  let flags = swisseph.SEFLG_SPEED | swisseph.SEFLG_MOSEPH;
+  let flags = swisseph.SEFLG_SPEED | swisseph.SEFLG_SWIEPH;
   if (normalizedSystem === "sidereal") {
     flags |= swisseph.SEFLG_SIDEREAL;
   }
@@ -679,7 +896,7 @@ async function calculateBirthchart({
       longitude: resolvedLocation.longitude,
       timezoneName
     },
-    timezoneNote,
+    timezoneNote: finalTimezoneNote,
     utcIso: utcDate.toISOString(),
     julianDayUT,
     ascendant: {
@@ -801,6 +1018,24 @@ function styleIntro(languageStyle) {
   return "SKU Owl mode is on: calm, clear, supportive, and practical.";
 }
 
+function normalizeReadingTier(tier) {
+  const normalized = (tier || "").trim().toLowerCase();
+  if (normalized === "tier1" || normalized === "newbie") {
+    return "tier1";
+  }
+  if (normalized === "tier2") {
+    return "tier2";
+  }
+  if (normalized === "tier3" || normalized === "seasoned") {
+    return "tier3";
+  }
+  if (normalized === "astrologist" || normalized === "junior astrologist") {
+    return "tier3";
+  }
+
+  return "tier3";
+}
+
 function formatBirthchartMessage(chart, languageStyle = "SKU Owl chill", fullName = "") {
   const mainInfo = buildMainFiveSentences(chart);
   const readingForLine = (fullName || "").trim()
@@ -855,19 +1090,26 @@ function buildBirthchartHtmlReport(
   chart,
   {
     languageStyle = "SKU Owl chill",
+    tier = "tier3",
     fullName = "",
     numerology = null,
     disclaimer = "",
+    brandLogoUrl = "",
     calendlyUrl = ""
   } = {}
 ) {
+  const reportTier = normalizeReadingTier(tier);
+  const isNewbie = reportTier === "tier1";
+  const isTier2 = reportTier === "tier2";
+  const isSeasoned = reportTier === "tier3";
   const bookingUrl = "https://calendly.com/kervinheart/astrology-soul-blueprint-session?back=1&month=2026-02";
   const displayName = (fullName || "").trim() || "Student";
   const mainFive = buildMainFiveItems(chart);
   const toneLabel = (languageStyle || "").trim().toLowerCase() === "sku owl chill"
     ? "SKU Owl chill"
     : "SKU Owl";
-  const keyPlacements = [
+  const logoUrl = (brandLogoUrl || "").trim();
+  const allKeyPlacements = [
     ["Sun", chart.planets.Sun],
     ["Moon", chart.planets.Moon],
     ["Rising", chart.ascendant],
@@ -876,6 +1118,9 @@ function buildBirthchartHtmlReport(
     ["Mars", chart.planets.Mars],
     ["Chart Ruler", chart.chartRuler]
   ];
+  const keyPlacements = isNewbie
+    ? allKeyPlacements.slice(0, 3)
+    : allKeyPlacements;
 
   const keyPlacementCards = keyPlacements.map(([label, placement]) => `
     <article class="card">
@@ -883,6 +1128,20 @@ function buildBirthchartHtmlReport(
       <p><strong>${escapeHtml(placement.sign)}</strong> ${escapeHtml(placement.degree)}</p>
       <p>${Number.isFinite(placement.house) ? `House ${placement.house}` : "Angle"}</p>
     </article>
+  `).join("");
+
+  const houseData = Array.from({ length: 12 }, (_, i) => {
+    const house = i + 1;
+    const sign = chart.houseCuspSigns[i];
+    const planets = chart.planetsByHouse[house] || [];
+    const topic = HOUSE_TOPICS[house];
+    return { house, sign, planets, topic };
+  });
+
+  const houseKeyButtons = houseData.map((item) => `
+    <button type="button" class="house-key-btn" data-house="${item.house}">
+      H${item.house}: ${escapeHtml(item.sign)}
+    </button>
   `).join("");
 
   const housesBlocks = Array.from({ length: 12 }, (_, i) => {
@@ -894,13 +1153,20 @@ function buildBirthchartHtmlReport(
       ? `${sign} on House ${house} adds a ${SIGN_STYLE[sign]} tone to ${HOUSE_TOPICS[house]}. With ${planets.join(", ")} here, this area is active and visible in daily choices.`
       : `${sign} on House ${house} adds a ${SIGN_STYLE[sign]} tone to ${HOUSE_TOPICS[house]}. No major natal planets here means this area grows through steady attention and life timing.`;
     const tip = STUDY_HINTS[(house + chart.mainLesson.house) % STUDY_HINTS.length];
+    const researchQuery = encodeURIComponent(`${sign} in house ${house} astrology meaning`);
+    const applyQuery = encodeURIComponent(`how to apply house ${house} ${sign} astrology in daily life`);
 
     return `
-      <article class="house-card">
+      <article class="house-card" id="house-card-${house}" data-house-card="${house}">
         <h3>House ${house}: ${escapeHtml(sign)}</h3>
         <p>${escapeHtml(blend)}</p>
         <p><strong>Planets:</strong> ${escapeHtml(planetsText)}</p>
         <p class="tip"><strong>Hint:</strong> ${escapeHtml(tip)}</p>
+        <p class="research-links">
+          <a href="https://www.google.com/search?q=${researchQuery}" target="_blank" rel="noopener noreferrer">Research this house meaning</a>
+          <span> | </span>
+          <a href="https://www.google.com/search?q=${applyQuery}" target="_blank" rel="noopener noreferrer">Apply this in daily life</a>
+        </p>
       </article>
     `;
   }).join("");
@@ -931,6 +1197,64 @@ function buildBirthchartHtmlReport(
   const timezoneNoteBlock = chart.timezoneNote
     ? `<p class="note">${escapeHtml(chart.timezoneNote)}</p>`
     : "";
+
+  const tierLabel = isNewbie
+    ? "tier1 newbie"
+    : (isTier2 ? "tier2 junior astrologist" : "tier3 astrologist");
+
+  const newbieGuideSection = isNewbie ? `
+    <section class="panel">
+      <h2>How To Read Your Big 3 (Newbie Guide)</h2>
+      <p><strong>Step 1: Sun</strong> shows how you build confidence and purpose. Track where your Sun sign themes show up in work and goals this week.</p>
+      <p><strong>Step 2: Moon</strong> shows emotional needs and regulation patterns. Track your Moon house during stress and recovery moments.</p>
+      <p><strong>Step 3: Rising</strong> shows first style and approach. Notice how people read you before you explain yourself.</p>
+      <p><strong>Apply it daily:</strong> Pick one Big-3 placement per day and write one behavior change you can test in real life.</p>
+    </section>
+  ` : "";
+
+  const housesGuideSection = (isTier2 || isSeasoned) ? `
+    <section class="panel">
+      <h2>How To Read The Houses (Apply To Self)</h2>
+      <p>Each house shows a life area. Read in this order: cusp sign → planets in house → one behavior to test this week.</p>
+      <p>Use the wheel/key to jump by house, then use “Research” and “Apply” links under each house card.</p>
+    </section>
+  ` : "";
+
+  const advancedSection = isSeasoned ? `
+    <section class="panel">
+      <h2>Seasoned Practitioner Layer</h2>
+      <p><strong>Chart ruler protocol:</strong> Start with Asc sign ruler (${escapeHtml(chart.chartRuler.name)}), then track that planet’s sign (${escapeHtml(chart.chartRuler.sign)}) and house (${chart.chartRuler.house}) as the core operating thread.</p>
+      <p><strong>Dominant houses:</strong> ${escapeHtml(focusZoneText(chart.focusHouses))}. Use these as your priority training zones for decisions, timing, and mentoring others.</p>
+      <p><strong>Integration:</strong> Pair superpower (${escapeHtml(chart.superpower.name)} H${chart.superpower.house}) with lesson (${escapeHtml(chart.mainLesson.name)} H${chart.mainLesson.house}) to avoid blind spots while guiding others.</p>
+    </section>
+  ` : "";
+
+  const reflectionPrompts = isNewbie
+    ? [
+      "Where did I act most like my Rising sign today, and what was the outcome?",
+      "What emotion did my Moon house highlight this week, and how did I respond?",
+      "What one Sun-sign behavior can I practice tomorrow with intention?"
+    ]
+    : (isTier2
+      ? [
+        "Which house is most activated right now, and what real-life pattern proves it?",
+        "Where am I over-identifying with one placement and ignoring balance?",
+        "What boundary or routine would align this chart theme with healthier action?"
+      ]
+      : [
+        "How does my chart ruler strategy appear in leadership, conflict, and service?",
+        "Which superpower placement can I teach responsibly without overpromising outcomes?",
+        "What is the clearest Saturn-based growth edge I can operationalize this month?"
+      ]);
+  const reflectionPromptsSection = `
+    <section class="panel">
+      <h2>Owl Reflection Prompts</h2>
+      <p>Use one prompt daily for internal dialogue, then write one concrete action step.</p>
+      <ul class="prompt-list">
+        ${reflectionPrompts.map((prompt) => `<li>${escapeHtml(prompt)}</li>`).join("")}
+      </ul>
+    </section>
+  `;
 
   return `<!doctype html>
 <html lang="en">
@@ -974,8 +1298,8 @@ function buildBirthchartHtmlReport(
     h1, h2, h3 {
       margin: 0 0 8px;
     }
-    h1 { font-size: 1.5rem; }
-    h2 { font-size: 1.2rem; margin-top: 2px; }
+    h1 { font-size: clamp(1.3rem, 1.8vw, 1.75rem); }
+    h2 { font-size: clamp(1.05rem, 1.4vw, 1.25rem); margin-top: 2px; }
     h3 { font-size: 1rem; }
     p { margin: 6px 0; color: var(--muted); }
     .expectation {
@@ -1010,6 +1334,54 @@ function buildBirthchartHtmlReport(
       padding: 10px;
       background: #fff;
     }
+    .wheel-wrap {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 1fr;
+      margin-top: 10px;
+    }
+    .wheel-canvas {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+    }
+    .wheel-canvas svg {
+      width: min(560px, 100%);
+      height: auto;
+    }
+    .house-segment {
+      cursor: pointer;
+      transition: opacity 0.15s ease, stroke-width 0.15s ease;
+      opacity: 0.88;
+    }
+    .house-segment:hover { opacity: 1; }
+    .house-segment.active {
+      stroke: #111827 !important;
+      stroke-width: 2;
+      opacity: 1;
+    }
+    .house-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .house-key-btn {
+      border: 1px solid var(--line);
+      background: #f8fbff;
+      border-radius: 999px;
+      padding: 6px 10px;
+      cursor: pointer;
+      color: var(--ink);
+      font-size: 0.9rem;
+    }
+    .house-key-btn.active {
+      background: #e5f0ff;
+      border-color: #9fc2ff;
+    }
     .cta-priority {
       background: var(--cta-bg);
       border: 1px solid #f7d8b0;
@@ -1033,6 +1405,11 @@ function buildBirthchartHtmlReport(
       padding: 10px;
       margin-top: 8px;
       background: #fff;
+      scroll-margin-top: 24px;
+    }
+    .house-card.active {
+      border-color: #8bb3ff;
+      box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.12);
     }
     .tip {
       font-size: 0.93rem;
@@ -1040,6 +1417,10 @@ function buildBirthchartHtmlReport(
       border-left: 3px solid var(--accent);
       background: #f8fbff;
       border-radius: 6px;
+    }
+    .research-links {
+      margin-top: 8px;
+      font-size: 0.9rem;
     }
     .cta-link {
       margin-top: 10px;
@@ -1064,6 +1445,46 @@ function buildBirthchartHtmlReport(
       font-size: 0.9rem;
       color: var(--muted);
     }
+    .brand-notice {
+      margin-top: 8px;
+      font-size: 0.88rem;
+      color: #374151;
+      background: #fff8e8;
+      border: 1px solid #f3dfb7;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    .brand-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .brand-logo {
+      width: clamp(64px, 10vw, 90px);
+      height: clamp(64px, 10vw, 90px);
+      object-fit: contain;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 4px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+    }
+    .prompt-list {
+      margin: 8px 0 0 20px;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .prompt-list li {
+      color: var(--ink);
+      background: #f8fbff;
+      border: 1px solid #d8e9ff;
+      border-radius: 8px;
+      padding: 8px 10px;
+      list-style-position: outside;
+    }
     .sticky-footer {
       position: fixed;
       left: 0;
@@ -1085,6 +1506,16 @@ function buildBirthchartHtmlReport(
       color: #0b1220;
     }
     @media (max-width: 640px) {
+      .container {
+        padding: 12px 10px 120px;
+      }
+      .panel {
+        padding: 12px;
+      }
+      .btn {
+        width: 100%;
+        text-align: center;
+      }
       .sticky-footer {
         flex-direction: column;
         align-items: stretch;
@@ -1098,10 +1529,16 @@ function buildBirthchartHtmlReport(
 <body>
   <main class="container">
     <section class="panel">
-      <h1>SKU Owl Astrology + Numerology Report 🦉✨</h1>
+      <div class="brand-head">
+        ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="Kervin Heart brand logo" class="brand-logo">` : ""}
+        <h1>SKU Owl Astrology + Numerology Report 🦉✨</h1>
+      </div>
+      <p><strong>Brand:</strong> SKU Owl™ by Kervin Heart LLC</p>
+      <p><strong>Report tier:</strong> ${escapeHtml(tierLabel)}</p>
       <p><strong>Reading for:</strong> ${escapeHtml(displayName)} <!-- {{fullName}} --></p>
       <p><strong>Tone:</strong> ${escapeHtml(toneLabel)} <!-- {{languageStyle}} --></p>
       <p class="expectation">This report is designed to give you insight without back-and-forth messages. If you want personal guidance, use the booking link included in this report.</p>
+      <p class="brand-notice">Trademark Notice: SKU Owl™, Self Knowledge University™, and related SKU marks are proprietary brand assets of Kervin Heart LLC. Unauthorized commercial use, copying, or resale is prohibited.</p>
       <p>${escapeHtml(locationLine)} <!-- {{locationDisplay}} {{timezoneName}} {{system}} {{houseSystem}} --></p>
       ${timezoneNoteBlock}
     </section>
@@ -1127,18 +1564,39 @@ function buildBirthchartHtmlReport(
       <div class="grid">${keyPlacementCards}</div>
     </section>
 
-    <section class="panel">
+    ${newbieGuideSection}
+
+    ${(isTier2 || isSeasoned) ? `<section class="panel">
+      <h2>Interactive House Wheel & Key</h2>
+      <p>Tap a house on the wheel or key to highlight it, jump to your meaning, and use linked research/application resources.</p>
+      <div class="wheel-wrap">
+        <div class="wheel-canvas">
+          <svg id="house-wheel" viewBox="-170 -170 340 340" role="img" aria-label="Interactive 12-house chart wheel"></svg>
+        </div>
+        <div class="house-key">
+          ${houseKeyButtons}
+        </div>
+      </div>
+    </section>` : ""}
+
+    ${housesGuideSection}
+
+    ${(isTier2 || isSeasoned) ? `<section class="panel">
       <h2>Houses & Life Areas</h2>
       ${housesBlocks}
       <p class="cta-link"><a href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener noreferrer">→ Schedule your personal reading</a></p>
-    </section>
+    </section>` : ""}
 
-    <section class="panel">
+    ${(isTier2 || isSeasoned) ? `<section class="panel">
       <h2>Numerology Insights</h2>
       <div class="grid">
         ${numerologySection}
       </div>
-    </section>
+    </section>` : ""}
+
+    ${reflectionPromptsSection}
+
+    ${advancedSection}
 
     <section class="panel book-section">
       <h2>Book a Session</h2>
@@ -1157,12 +1615,106 @@ function buildBirthchartHtmlReport(
       <p>${escapeHtml(disclaimer || "This report supports self-awareness and education. It is not a substitute for licensed care.")}</p>
     </section>
 
-    <p class="report-end">Generated by SKU Owl on ${escapeHtml(new Date().toISOString())}.<br>© Kervin Heart LLC</p>
+    <p class="report-end">Generated by SKU Owl™ on ${escapeHtml(new Date().toISOString())}.<br>© Kervin Heart LLC. All rights reserved.<br>SKU Owl™ and Self Knowledge University™ are trademarks of Kervin Heart LLC.</p>
   </main>
   <footer class="sticky-footer">
     <span>Ready to apply your chart to your real life?</span>
     <a class="btn" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener noreferrer">Book Reading</a>
   </footer>
+  <script>
+    const houseData = ${JSON.stringify(houseData).replace(/</g, "\\u003c")};
+    const palette = ["#fcd34d","#fde68a","#bbf7d0","#a7f3d0","#bfdbfe","#c7d2fe","#ddd6fe","#fecdd3","#fdba74","#fecaca","#bae6fd","#d9f99d"];
+    const wheel = document.getElementById("house-wheel");
+    const keyButtons = Array.from(document.querySelectorAll(".house-key-btn"));
+    const houseCards = Array.from(document.querySelectorAll("[data-house-card]"));
+
+    function polar(r, deg) {
+      const rad = (deg - 90) * (Math.PI / 180);
+      return { x: r * Math.cos(rad), y: r * Math.sin(rad) };
+    }
+
+    function arcPath(innerR, outerR, startDeg, endDeg) {
+      const p1 = polar(outerR, startDeg);
+      const p2 = polar(outerR, endDeg);
+      const p3 = polar(innerR, endDeg);
+      const p4 = polar(innerR, startDeg);
+      return [
+        "M", p1.x, p1.y,
+        "A", outerR, outerR, 0, 0, 1, p2.x, p2.y,
+        "L", p3.x, p3.y,
+        "A", innerR, innerR, 0, 0, 0, p4.x, p4.y,
+        "Z"
+      ].join(" ");
+    }
+
+    function setActive(house) {
+      document.querySelectorAll(".house-segment").forEach((el) => {
+        el.classList.toggle("active", Number(el.dataset.house) === house);
+      });
+      keyButtons.forEach((btn) => {
+        btn.classList.toggle("active", Number(btn.dataset.house) === house);
+      });
+      houseCards.forEach((card) => {
+        card.classList.toggle("active", Number(card.dataset.houseCard) === house);
+      });
+    }
+
+    function jumpToHouse(house) {
+      setActive(house);
+      const target = document.getElementById("house-card-" + house);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+
+    function drawWheel() {
+      const NS = "http://www.w3.org/2000/svg";
+      const innerR = 70;
+      const outerR = 150;
+      for (let i = 0; i < 12; i += 1) {
+        const house = i + 1;
+        const start = -120 + (i * 30);
+        const end = start + 30;
+        const path = document.createElementNS(NS, "path");
+        path.setAttribute("d", arcPath(innerR, outerR, start, end));
+        path.setAttribute("fill", palette[i % palette.length]);
+        path.setAttribute("stroke", "#ffffff");
+        path.setAttribute("stroke-width", "1");
+        path.setAttribute("class", "house-segment");
+        path.dataset.house = house;
+        path.addEventListener("click", () => jumpToHouse(house));
+        wheel.appendChild(path);
+
+        const label = document.createElementNS(NS, "text");
+        const mid = start + 15;
+        const pos = polar(110, mid);
+        label.setAttribute("x", pos.x);
+        label.setAttribute("y", pos.y);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("dominant-baseline", "middle");
+        label.setAttribute("font-size", "11");
+        label.setAttribute("fill", "#0f172a");
+        label.textContent = "H" + house;
+        wheel.appendChild(label);
+      }
+
+      const center = document.createElementNS(NS, "circle");
+      center.setAttribute("cx", "0");
+      center.setAttribute("cy", "0");
+      center.setAttribute("r", String(65));
+      center.setAttribute("fill", "#ffffff");
+      center.setAttribute("stroke", "#dbe3ef");
+      wheel.appendChild(center);
+    }
+
+    if (wheel && keyButtons.length > 0) {
+      drawWheel();
+      keyButtons.forEach((btn) => {
+        btn.addEventListener("click", () => jumpToHouse(Number(btn.dataset.house)));
+      });
+      setActive(1);
+    }
+  </script>
 </body>
 </html>`;
 }

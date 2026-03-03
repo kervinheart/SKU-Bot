@@ -1,5 +1,8 @@
 const {
+  ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   EmbedBuilder,
   Events,
@@ -17,6 +20,7 @@ const {
   guildId,
   kervinCalendlyUrl,
   kervinUserId,
+  brandLogoUrl,
   googleMapsApiKey,
   nominatimUserAgent,
   openCageApiKey,
@@ -100,6 +104,20 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName("book")
     .setDescription("Get the private reading booking link."),
+
+  new SlashCommandBuilder()
+    .setName("guide")
+    .setDescription("Interactive guide for study hall members and free members.")
+    .addStringOption((option) =>
+      option
+        .setName("member_type")
+        .setDescription("Which path do you want?")
+        .addChoices(
+          { name: "free_member", value: "free_member" },
+          { name: "studyhall_member", value: "studyhall_member" }
+        )
+        .setRequired(false)
+    ),
 
   new SlashCommandBuilder()
     .setName("start")
@@ -218,9 +236,26 @@ const slashCommands = [
     )
     .addStringOption((option) =>
       option
+        .setName("timezone")
+        .setDescription("Optional IANA timezone override (example: America/New_York).")
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
         .setName("language_style")
         .setDescription("Message tone preset.")
         .addChoices({ name: "SKU Owl chill", value: "SKU Owl chill" })
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("tier")
+        .setDescription("Reading depth tier.")
+        .addChoices(
+          { name: "tier1 newbie (Big 3 + learning guide)", value: "tier1" },
+          { name: "tier2 junior astrologist (houses + application)", value: "tier2" },
+          { name: "tier3 astrologist (full advanced report)", value: "tier3" }
+        )
         .setRequired(false)
     )
     .addBooleanOption((option) =>
@@ -240,10 +275,17 @@ function withPrivateVisibility(interaction, payload) {
 }
 
 async function replyPrivatelyOrDm(interaction, payload, successMessage) {
-  await interaction.reply(withPrivateVisibility(interaction, {
-    content: successMessage
-  }));
-  await interaction.followUp(withPrivateVisibility(interaction, payload));
+  try {
+    await interaction.user.send(payload);
+    await interaction.reply(withPrivateVisibility(interaction, {
+      content: successMessage
+    }));
+    return;
+  } catch (error) {
+    await interaction.reply(withPrivateVisibility(interaction, {
+      content: "I couldn't DM you. Please enable DMs from server members and try again."
+    }));
+  }
 }
 
 async function replyChunked(interaction, chunks) {
@@ -254,11 +296,18 @@ async function replyChunked(interaction, chunks) {
 }
 
 async function replyChunkedPrivatelyOrDm(interaction, chunks, successMessage) {
-  await interaction.reply(withPrivateVisibility(interaction, {
-    content: successMessage
-  }));
-  for (const chunk of chunks) {
-    await interaction.followUp(withPrivateVisibility(interaction, { content: chunk }));
+  try {
+    for (const chunk of chunks) {
+      await interaction.user.send({ content: chunk });
+    }
+    await interaction.reply(withPrivateVisibility(interaction, {
+      content: successMessage
+    }));
+    return;
+  } catch (error) {
+    await interaction.reply(withPrivateVisibility(interaction, {
+      content: "I couldn't DM you. Please enable DMs from server members and try again."
+    }));
   }
 }
 
@@ -493,6 +542,101 @@ function buildStudyHallEmbed(minutes) {
     .setFooter({ text: "Consistency beats cramming. Repeat this structure each session." });
 }
 
+function buildInteractiveGuideEmbed(memberType) {
+  const isStudyHall = memberType === "studyhall_member";
+  return new EmbedBuilder()
+    .setTitle(isStudyHall ? "Study Hall Member Guide" : "Free Member Guide")
+    .setColor(isStudyHall ? 0x1d4ed8 : 0x0f766e)
+    .setDescription(isStudyHall
+      ? "Choose a step below. SKU Owl will guide your study structure, self-check, and deeper chart flow."
+      : "Choose a step below. SKU Owl will guide your starter tools for self-study and personal growth.")
+    .addFields(
+      {
+        name: "Start Here",
+        value: isStudyHall
+          ? "1) Build session plan\n2) Run birthchart (tier2)\n3) Use references when stuck"
+          : "1) Basic numerology\n2) Birthchart tier1\n3) Ground-zero references"
+      }
+    );
+}
+
+function buildGuideButtons(memberType) {
+  const isStudyHall = memberType === "studyhall_member";
+  if (isStudyHall) {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("guide:studyhall_plan").setLabel("Start Study Plan").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("guide:birthchart_tier2").setLabel("Birthchart Tier 2").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("guide:refs:tier2").setLabel("Not sure where to start?").setStyle(ButtonStyle.Success)
+      )
+    ];
+  }
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("guide:start_basic").setLabel("Basic Reading").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("guide:birthchart_tier1").setLabel("Birthchart Tier 1").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("guide:refs:tier1").setLabel("Not sure where to start?").setStyle(ButtonStyle.Success)
+    )
+  ];
+}
+
+function buildGroundZeroReferencesEmbed(tier) {
+  const isTier2 = tier === "tier2";
+  const title = isTier2
+    ? "Ground-Zero Research (Tier 2: Junior Astrologist)"
+    : "Ground-Zero Research (Tier 1: Newbie)";
+
+  const starterTrack = isTier2
+    ? [
+      "1) Verify your Big 3 + house system (Placidus vs Whole Sign).",
+      "2) Map each house to one real-life area this week.",
+      "3) Track 3 repeating patterns before interpretation."
+    ].join("\n")
+    : [
+      "1) Learn Sun, Moon, Rising first.",
+      "2) Write one sentence for each: identity, emotion, approach.",
+      "3) Apply one placement in real life for 7 days."
+    ].join("\n");
+
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setColor(0x334155)
+    .setDescription("Use this as your baseline research stack before deeper interpretation.")
+    .addFields(
+      {
+        name: "How To Start",
+        value: starterTrack
+      },
+      {
+        name: "Reference Links",
+        value: [
+          "[Astro.com - Chart basics](https://www.astro.com/)",
+          "[Cafe Astrology - House meanings](https://cafeastrology.com/articles/housesinastrology.html)",
+          "[Astro-Seek - Input checker](https://horoscopes.astro-seek.com/birth-chart-horoscope-online)",
+          "[NIMH - Mental health grounding](https://www.nimh.nih.gov/health)",
+          "[988 Lifeline](https://988lifeline.org/)"
+        ].join("\n")
+      },
+      {
+        name: "Apply In Daily Life",
+        value: "Pick one house theme and one behavior change. Track outcomes for 7 days before making a new conclusion."
+      }
+    )
+    .setFooter({ text: "SKU Owl: Learn -> Apply -> Reflect." });
+}
+
+async function replyButtonPrivatelyOrDm(interaction, payload, successMessage = "Sent to your DMs.") {
+  try {
+    await interaction.user.send(payload);
+    await interaction.reply(withPrivateVisibility(interaction, { content: successMessage }));
+  } catch (error) {
+    await interaction.reply(withPrivateVisibility(interaction, {
+      content: "I couldn't DM you. Please enable DMs from server members and try again."
+    }));
+  }
+}
+
 function formatNumber(value) {
   if (MASTER_NUMBERS.has(value)) {
     return `${value} (Master)`;
@@ -674,6 +818,52 @@ client.once(Events.ClientReady, (readyClient) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isButton()) {
+      if (interaction.customId === "guide:studyhall_plan") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          embeds: [buildStudyHallEmbed(60)]
+        }, "Study hall plan sent to your DMs.");
+        return;
+      }
+
+      if (interaction.customId === "guide:start_basic") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          content: "Run `/start full_name:Your Name birthdate:YYYY-MM-DD` for your basic numerology reading."
+        }, "Starter instruction sent to your DMs.");
+        return;
+      }
+
+      if (interaction.customId === "guide:birthchart_tier1") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          content: "Run `/birthchart date:YYYY-MM-DD time:HH:MM location:City, ST tier:tier1`"
+        }, "Tier1 instruction sent to your DMs.");
+        return;
+      }
+
+      if (interaction.customId === "guide:birthchart_tier2") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          content: "Run `/birthchart date:YYYY-MM-DD time:HH:MM location:City, ST tier:tier2`"
+        }, "Tier2 instruction sent to your DMs.");
+        return;
+      }
+
+      if (interaction.customId === "guide:refs:tier1") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          embeds: [buildGroundZeroReferencesEmbed("tier1")]
+        }, "Tier1 reference guide sent to your DMs.");
+        return;
+      }
+
+      if (interaction.customId === "guide:refs:tier2") {
+        await replyButtonPrivatelyOrDm(interaction, {
+          embeds: [buildGroundZeroReferencesEmbed("tier2")]
+        }, "Tier2 reference guide sent to your DMs.");
+        return;
+      }
+
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) {
       return;
     }
@@ -727,8 +917,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             name: "/birthchart",
             value: [
               "Input format:",
-              "`full_name` (optional), `date` YYYY-MM-DD, `time` HH:MM (24h), `location` city/state or lat,long.",
-              "Example: `/birthchart full_name:Jane Doe date:1995-08-14 time:13:45 location:Los Angeles, CA`",
+              "`full_name` (optional), `date` YYYY-MM-DD, `time` HH:MM (24h), `location` city/state or lat,long, `timezone` (optional IANA).",
+              "Example: `/birthchart full_name:Jane Doe date:1995-08-14 time:13:45 location:Los Angeles, CA timezone:America/Los_Angeles tier:tier1`",
               "Full report is always auto-sent by DM.",
               "Use `share_quick_reading:true` only if you want a short channel summary."
             ].join("\n")
@@ -743,56 +933,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         );
 
-      await interaction.reply(withPrivateVisibility(interaction, { embeds: [embed] }));
+      await replyPrivatelyOrDm(
+        interaction,
+        { embeds: [embed] },
+        "Help guide sent to your DMs."
+      );
       return;
     }
 
     if (interaction.commandName === "policy") {
-      const sendDm = interaction.options.getBoolean("dm") !== false;
       const chunks = splitDiscordMessage(FULL_POLICY_TEXT);
-
-      if (sendDm) {
-        await replyChunkedPrivatelyOrDm(
-          interaction,
-          chunks,
-          "SKU Owl sent the full Safety & Use Policy as a private response."
-        );
-        return;
-      }
-
-      await replyChunked(interaction, chunks);
+      await replyChunkedPrivatelyOrDm(
+        interaction,
+        chunks,
+        "SKU Owl sent the full Safety & Use Policy to your DMs."
+      );
       return;
     }
 
     if (interaction.commandName === "resources") {
-      const sendDm = interaction.options.getBoolean("dm") !== false;
       const chunks = splitDiscordMessage(buildFactResourcesMessage());
-
-      if (sendDm) {
-        await replyChunkedPrivatelyOrDm(
-          interaction,
-          chunks,
-          "SKU Owl sent fact-based resources as a private response."
-        );
-        return;
-      }
-
-      await replyChunked(interaction, chunks);
+      await replyChunkedPrivatelyOrDm(
+        interaction,
+        chunks,
+        "SKU Owl sent fact-based resources to your DMs."
+      );
       return;
     }
 
     if (interaction.commandName === "book") {
-      await interaction.reply(withPrivateVisibility(interaction, {
-        content: buildBookReplyMessage()
-      }));
+      await replyPrivatelyOrDm(
+        interaction,
+        { content: buildBookReplyMessage() },
+        "Booking details sent to your DMs."
+      );
+      return;
+    }
+
+    if (interaction.commandName === "guide") {
+      const memberType = interaction.options.getString("member_type") || "free_member";
+      await replyPrivatelyOrDm(interaction, {
+        embeds: [buildInteractiveGuideEmbed(memberType)],
+        components: buildGuideButtons(memberType)
+      }, "Interactive guide sent to your DMs.");
       return;
     }
 
     if (interaction.commandName === "start") {
       const fullName = interaction.options.getString("full_name", true);
       const birthdateInput = interaction.options.getString("birthdate", true);
-      const sendDm = interaction.options.getBoolean("dm") !== false;
-
       let profile;
       try {
         profile = calculateNumerologyProfile({
@@ -810,34 +999,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const payload = { embeds: [buildBasicReadingEmbed(profile)] };
 
-      if (sendDm) {
-        await replyPrivatelyOrDm(
-          interaction,
-          payload,
-          "SKU Owl sent your basic reading as a private response."
-        );
-        return;
-      }
-
-      await interaction.reply(withPrivateVisibility(interaction, payload));
+      await replyPrivatelyOrDm(
+        interaction,
+        payload,
+        "SKU Owl sent your basic reading to your DMs."
+      );
       return;
     }
 
     if (interaction.commandName === "studyhall") {
       const minutes = interaction.options.getInteger("minutes") || 60;
-      const sendDm = interaction.options.getBoolean("dm") === true;
       const embed = buildStudyHallEmbed(minutes);
-
-      if (sendDm) {
-        await replyPrivatelyOrDm(
-          interaction,
-          { embeds: [embed] },
-          "SKU Owl sent your study hall plan as a private response."
-        );
-        return;
-      }
-
-      await interaction.reply(withPrivateVisibility(interaction, { embeds: [embed] }));
+      await replyPrivatelyOrDm(
+        interaction,
+        { embeds: [embed] },
+        "SKU Owl sent your study hall plan to your DMs."
+      );
       return;
     }
 
@@ -845,8 +1022,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const fullName = interaction.options.getString("full_name", true);
       const birthdateInput = interaction.options.getString("birthdate", true);
       const includeYAsVowel = interaction.options.getBoolean("include_y_as_vowel") === true;
-      const sendDm = interaction.options.getBoolean("dm") !== false;
-
       let profile;
       try {
         profile = calculateNumerologyProfile({
@@ -864,16 +1039,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const payload = { embeds: buildNumerologyEmbeds(profile) };
 
-      if (sendDm) {
-        await replyPrivatelyOrDm(
-          interaction,
-          payload,
-          "SKU Owl sent your numerology report as a private response."
-        );
-        return;
-      }
-
-      await interaction.reply(withPrivateVisibility(interaction, payload));
+      await replyPrivatelyOrDm(
+        interaction,
+        payload,
+        "SKU Owl sent your numerology report to your DMs."
+      );
       return;
     }
 
@@ -891,9 +1061,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const time = interaction.options.getString("time", true);
       const location = interaction.options.getString("location", true);
       const system = interaction.options.getString("system") || "tropical";
-      const houseSystem = interaction.options.getString("house_system") || "whole_sign";
+      const houseSystem = interaction.options.getString("house_system") || "placidus";
+      const timezoneOverride = interaction.options.getString("timezone");
       const languageStyle = interaction.options.getString("language_style") || "SKU Owl chill";
-      const shareQuickReading = interaction.options.getBoolean("share_quick_reading") === true;
+      const tier = interaction.options.getString("tier") || "tier3";
+      const shareQuickReading = false;
 
       await interaction.deferReply(withPrivateVisibility(interaction, {}));
 
@@ -905,6 +1077,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           location,
           system,
           houseSystem,
+          timezoneOverride,
           nominatimUserAgent,
           googleMapsApiKey,
           openCageApiKey,
@@ -917,15 +1090,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const report = formatBirthchartMessage(chart, languageStyle, fullName || "");
       const numerology = buildNumerologyForReport({
         birthdateInput: date,
         fullName: fullName || ""
       });
       const htmlReport = buildBirthchartHtmlReport(chart, {
         languageStyle,
+        tier,
         fullName: fullName || "",
         numerology,
+        brandLogoUrl,
         calendlyUrl: kervinCalendlyUrl,
         disclaimer: "SKU Owl is a reflection companion for education and self-awareness. It is not therapy, medical care, or crisis treatment."
       });
@@ -933,12 +1107,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const htmlAttachment = new AttachmentBuilder(Buffer.from(htmlReport, "utf8"), {
         name: fileName
       });
+      const starterComponents = (tier === "tier1" || tier === "tier2")
+        ? [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`guide:refs:${tier}`)
+              .setLabel("Not sure where to start?")
+              .setStyle(ButtonStyle.Success)
+          )
+        ]
+        : [];
 
       try {
         await interaction.user.send({
           content: [
             "Your private SKU Owl birthchart report is ready.",
             "Open the attached HTML file in your browser.",
+            `Using location: ${chart.location.displayName}`,
+            `Using timezone: ${chart.location.timezoneName}`,
+            `Using UTC time: ${chart.utcIso}`,
+            `Report tier: ${tier}`,
             "",
             "Input format reminder:",
             "- Full name: optional",
@@ -946,7 +1134,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             "- Time of birth: HH:MM (24h)",
             "- Place of birth: city/state or lat,long"
           ].join("\n"),
-          files: [htmlAttachment]
+          files: [htmlAttachment],
+          components: starterComponents
         });
       } catch (error) {
         await interaction.editReply(withPrivateVisibility(interaction, {
@@ -958,15 +1147,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.editReply(withPrivateVisibility(interaction, {
         content: "Your full private birthchart report was sent to your DMs."
       }));
-
-      if (shareQuickReading && interaction.inGuild()) {
-        await interaction.followUp({
-          content: [
-            `${interaction.user} asked for a quick reading preview:`,
-            report.split("\n\n")[0]
-          ].join("\n")
-        });
-      }
       return;
     }
   } catch (error) {
