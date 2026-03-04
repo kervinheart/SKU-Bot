@@ -44,6 +44,7 @@ const {
   formatBirthchartMessage,
   splitDiscordMessage
 } = require("./birthchart");
+const { version: botVersion } = require("../package.json");
 
 if (!botToken || !clientId) {
   console.error("Missing BOT_TOKEN or CLIENT_ID in your .env file.");
@@ -75,11 +76,16 @@ const FALSE_FLAG_CONFIRM_MS = 5 * 60 * 1000;
 const birthchartRateLimitByUser = new Map();
 const safetyLockByUser = new Map();
 const falseFlagConfirmByUser = new Map();
+const bootIso = new Date().toISOString();
 
 const slashCommands = [
   new SlashCommandBuilder()
     .setName("help")
     .setDescription("Show all SKU Owl bot commands."),
+
+  new SlashCommandBuilder()
+    .setName("health")
+    .setDescription("Check bot status, uptime, and deployment marker."),
 
   new SlashCommandBuilder()
     .setName("policy")
@@ -810,7 +816,9 @@ async function registerSlashCommands() {
 }
 
 client.once(Events.ClientReady, (readyClient) => {
+  const commit = (process.env.RENDER_GIT_COMMIT || "local").slice(0, 7);
   console.log(`Logged in as ${readyClient.user.tag}`);
+  console.log(`SKU Owl health marker | version=${botVersion} | commit=${commit} | boot=${bootIso}`);
   if (!enableMessageContentIntent) {
     console.log("Message-content intent is disabled. Use slash commands like /book, /birthchart, /numerology.");
   }
@@ -869,7 +877,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     const activeLock = getSafetyLock(interaction.user.id);
-    if (activeLock && !["help", "policy", "resources"].includes(interaction.commandName)) {
+    if (activeLock && !["help", "policy", "resources", "health"].includes(interaction.commandName)) {
       await interaction.reply(withPrivateVisibility(interaction, {
         content: buildLockMessage(activeLock)
       }));
@@ -878,7 +886,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const interactionText = extractInteractionText(interaction);
     const crisisDetection = detectCrisisSignal(interactionText);
-    if (crisisDetection.flagged && !["policy", "resources"].includes(interaction.commandName)) {
+    if (crisisDetection.flagged && !["policy", "resources", "health"].includes(interaction.commandName)) {
       setSafetyLock(interaction.user.id, crisisDetection);
 
       await interaction.reply(withPrivateVisibility(interaction, {
@@ -900,6 +908,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
               "`full_name` (required), `birthdate` YYYY-MM-DD.",
               "Example: `/start full_name:Jane Doe birthdate:1995-08-14`"
             ].join("\n")
+          },
+          {
+            name: "/health",
+            value: "Quick status check: online state, uptime, boot marker, and deploy commit."
           },
           {
             name: "/studyhall",
@@ -937,6 +949,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction,
         { embeds: [embed] },
         "Help guide sent to your DMs."
+      );
+      return;
+    }
+
+    if (interaction.commandName === "health") {
+      const commit = (process.env.RENDER_GIT_COMMIT || "local").slice(0, 7);
+      const uptimeSeconds = Math.floor(process.uptime());
+      const uptimeMinutes = Math.floor(uptimeSeconds / 60);
+      const uptimeRemainder = uptimeSeconds % 60;
+      const embed = new EmbedBuilder()
+        .setTitle("SKU Owl Health")
+        .setColor(0x10b981)
+        .setDescription("Service is online and responding.")
+        .addFields(
+          { name: "Version", value: `v${botVersion}`, inline: true },
+          { name: "Commit", value: commit, inline: true },
+          { name: "Uptime", value: `${uptimeMinutes}m ${uptimeRemainder}s`, inline: true },
+          { name: "Boot Time (UTC)", value: bootIso, inline: false }
+        );
+      await replyPrivatelyOrDm(
+        interaction,
+        { embeds: [embed] },
+        "Health status sent to your DMs."
       );
       return;
     }
