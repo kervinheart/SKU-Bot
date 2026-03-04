@@ -8,11 +8,15 @@ const {
   Events,
   GatewayIntentBits,
   MessageFlags,
+  PermissionFlagsBits,
   Partials,
   REST,
   Routes,
   SlashCommandBuilder
 } = require("discord.js");
+const fs = require("node:fs");
+const path = require("node:path");
+const { Temporal } = require("@js-temporal/polyfill");
 
 const {
   botToken,
@@ -73,10 +77,14 @@ const client = new Client({
 const BIRTHCHART_RATE_LIMIT_MS = 30_000;
 const CRISIS_LOCK_MS = 48 * 60 * 60 * 1000;
 const FALSE_FLAG_CONFIRM_MS = 5 * 60 * 1000;
+const INTRO_TZ = "America/New_York";
+const INTRO_SCHEDULE_FILE = path.resolve(process.cwd(), "data", "intro-schedule.json");
 const birthchartRateLimitByUser = new Map();
 const safetyLockByUser = new Map();
 const falseFlagConfirmByUser = new Map();
 const bootIso = new Date().toISOString();
+let introScheduleState = null;
+let introTimeoutHandle = null;
 
 const slashCommands = [
   new SlashCommandBuilder()
@@ -86,6 +94,50 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName("health")
     .setDescription("Check bot status, uptime, and deployment marker."),
+
+  new SlashCommandBuilder()
+    .setName("intro_now")
+    .setDescription("Post the SKU community introduction now.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("Channel to post the introduction.")
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("schedule_intro")
+    .setDescription("Schedule the SKU community introduction post.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((option) =>
+      option
+        .setName("date")
+        .setDescription("Date in YYYY-MM-DD (America/New_York)")
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("time")
+        .setDescription("Time in HH:MM 24h (America/New_York)")
+        .setRequired(true)
+    )
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("Channel to post the introduction.")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("intro_status")
+    .setDescription("Check scheduled intro post status.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("intro_cancel")
+    .setDescription("Cancel scheduled intro post.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("policy")
@@ -479,6 +531,128 @@ function buildFactResourcesMessage() {
   ].join("\n");
 }
 
+function buildIntroMessage() {
+  return [
+    "Hey community, I’m **SKU Owl** 🦉",
+    "I’m here to guide you through study hall structure, self-discovery tools, and private reflection reports.",
+    "",
+    "**How to start:**",
+    "- `/guide` for your path (free member or study hall member)",
+    "- `/birthchart` for private astrology report (DM only)",
+    "- `/numerology` for private numerology insights",
+    "- `/resources` for fact-based support links",
+    "",
+    "I support growth through reflection and action. I do not replace professional care.",
+    "If you’re in crisis, call/text **988** immediately."
+  ].join("\n");
+}
+
+function ensureScheduleDir() {
+  const dir = path.dirname(INTRO_SCHEDULE_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function saveIntroSchedule() {
+  ensureScheduleDir();
+  if (!introScheduleState) {
+    if (fs.existsSync(INTRO_SCHEDULE_FILE)) {
+      fs.unlinkSync(INTRO_SCHEDULE_FILE);
+    }
+    return;
+  }
+  fs.writeFileSync(INTRO_SCHEDULE_FILE, JSON.stringify(introScheduleState, null, 2), "utf8");
+}
+
+function loadIntroSchedule() {
+  if (!fs.existsSync(INTRO_SCHEDULE_FILE)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(INTRO_SCHEDULE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.channelId || !parsed.whenIso) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function postIntroToChannel(channelId) {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || typeof channel.send !== "function") {
+    throw new Error("Channel is unavailable or not postable.");
+  }
+  await channel.send({ content: buildIntroMessage() });
+}
+
+function clearIntroSchedule() {
+  if (introTimeoutHandle) {
+    clearTimeout(introTimeoutHandle);
+    introTimeoutHandle = null;
+  }
+  introScheduleState = null;
+  saveIntroSchedule();
+}
+
+function scheduleIntroTimer(schedule) {
+  if (introTimeoutHandle) {
+    clearTimeout(introTimeoutHandle);
+    introTimeoutHandle = null;
+  }
+
+  const runAtMs = new Date(schedule.whenIso).getTime();
+  const now = Date.now();
+  const delay = runAtMs - now;
+  if (!Number.isFinite(delay) || delay <= 0) {
+    return false;
+  }
+
+  introScheduleState = schedule;
+  saveIntroSchedule();
+  introTimeoutHandle = setTimeout(async () => {
+    try {
+      await postIntroToChannel(schedule.channelId);
+      console.log(`Posted scheduled intro to channel ${schedule.channelId} at ${new Date().toISOString()}.`);
+    } catch (error) {
+      console.error("Scheduled intro post failed:", error.message);
+    } finally {
+      clearIntroSchedule();
+    }
+  }, delay);
+
+  return true;
+}
+
+function parseIntroDateTime(dateText, timeText) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test((dateText || "").trim())) {
+    throw new Error("`date` must be YYYY-MM-DD.");
+  }
+  if (!/^\d{2}:\d{2}$/.test((timeText || "").trim())) {
+    throw new Error("`time` must be HH:MM in 24h format.");
+  }
+
+  const [year, month, day] = dateText.split("-").map((v) => Number.parseInt(v, 10));
+  const [hour, minute] = timeText.split(":").map((v) => Number.parseInt(v, 10));
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    throw new Error("`time` is out of range.");
+  }
+
+  let instant;
+  try {
+    const pdt = new Temporal.PlainDateTime(year, month, day, hour, minute);
+    const zdt = pdt.toZonedDateTime(INTRO_TZ);
+    instant = zdt.toInstant();
+  } catch {
+    throw new Error("Could not parse schedule date/time.");
+  }
+
+  return new Date(instant.epochMilliseconds).toISOString();
+}
+
 function isSnowflake(value) {
   return /^\d{17,20}$/.test((value || "").trim());
 }
@@ -828,6 +1002,17 @@ async function registerSlashCommands() {
     : Routes.applicationCommands(clientId);
 
   await rest.put(route, { body: slashCommands.map((command) => command.toJSON()) });
+
+  // If we are using guild commands, clear old global commands to avoid duplicates (e.g. two /guide entries).
+  if (normalizedGuildId) {
+    try {
+      await rest.put(Routes.applicationCommands(clientId), { body: [] });
+      console.log("Cleared global slash commands (guild mode active).");
+    } catch (error) {
+      console.warn("Could not clear global slash commands:", error.message);
+    }
+  }
+
   console.log(normalizedGuildId
     ? `Registered slash commands for guild ${normalizedGuildId}.`
     : "Registered global slash commands.");
@@ -839,6 +1024,16 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`SKU Owl health marker | version=${botVersion} | commit=${commit} | boot=${bootIso}`);
   if (!enableMessageContentIntent) {
     console.log("Message-content intent is disabled. Use slash commands like /book, /birthchart, /numerology.");
+  }
+
+  const pendingIntro = loadIntroSchedule();
+  if (pendingIntro) {
+    const armed = scheduleIntroTimer(pendingIntro);
+    if (armed) {
+      console.log(`Re-armed intro schedule for ${pendingIntro.whenIso} in channel ${pendingIntro.channelId}.`);
+    } else {
+      clearIntroSchedule();
+    }
   }
 });
 
@@ -991,6 +1186,90 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { embeds: [embed] },
         "Health status sent to your DMs."
       );
+      return;
+    }
+
+    if (interaction.commandName === "intro_now") {
+      const channel = interaction.options.getChannel("channel") || interaction.channel;
+      if (!channel) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "Could not resolve target channel."
+        }));
+        return;
+      }
+
+      try {
+        await postIntroToChannel(channel.id);
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Posted intro now in <#${channel.id}>.`
+        }));
+      } catch (error) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Could not post intro: ${error.message}`
+        }));
+      }
+      return;
+    }
+
+    if (interaction.commandName === "schedule_intro") {
+      const date = interaction.options.getString("date", true);
+      const time = interaction.options.getString("time", true);
+      const channel = interaction.options.getChannel("channel", true);
+      let whenIso;
+      try {
+        whenIso = parseIntroDateTime(date, time);
+      } catch (error) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Schedule input issue: ${error.message}`
+        }));
+        return;
+      }
+
+      const armed = scheduleIntroTimer({
+        whenIso,
+        channelId: channel.id,
+        scheduledBy: interaction.user.id,
+        createdAt: new Date().toISOString()
+      });
+      if (!armed) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "Scheduled time must be in the future."
+        }));
+        return;
+      }
+
+      await interaction.reply(withPrivateVisibility(interaction, {
+        content: `Intro scheduled for ${whenIso} (UTC) in <#${channel.id}>.`
+      }));
+      return;
+    }
+
+    if (interaction.commandName === "intro_status") {
+      if (!introScheduleState) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "No intro post is currently scheduled."
+        }));
+        return;
+      }
+
+      await interaction.reply(withPrivateVisibility(interaction, {
+        content: `Scheduled intro: ${introScheduleState.whenIso} (UTC) in <#${introScheduleState.channelId}>.`
+      }));
+      return;
+    }
+
+    if (interaction.commandName === "intro_cancel") {
+      if (!introScheduleState) {
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "No scheduled intro to cancel."
+        }));
+        return;
+      }
+
+      clearIntroSchedule();
+      await interaction.reply(withPrivateVisibility(interaction, {
+        content: "Scheduled intro canceled."
+      }));
       return;
     }
 
