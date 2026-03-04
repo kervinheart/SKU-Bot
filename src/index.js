@@ -15,6 +15,7 @@ const {
   SlashCommandBuilder
 } = require("discord.js");
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 const { Temporal } = require("@js-temporal/polyfill");
 
@@ -85,6 +86,7 @@ const falseFlagConfirmByUser = new Map();
 const bootIso = new Date().toISOString();
 let introScheduleState = null;
 let introTimeoutHandle = null;
+let healthServer = null;
 
 const slashCommands = [
   new SlashCommandBuilder()
@@ -138,6 +140,41 @@ const slashCommands = [
     .setName("intro_cancel")
     .setDescription("Cancel scheduled intro post.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("intro")
+    .setDescription("Manage SKU community intro post (now, schedule, status, cancel).")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((option) =>
+      option
+        .setName("action")
+        .setDescription("What do you want to do?")
+        .addChoices(
+          { name: "now", value: "now" },
+          { name: "schedule", value: "schedule" },
+          { name: "status", value: "status" },
+          { name: "cancel", value: "cancel" }
+        )
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("date")
+        .setDescription("For action=schedule: date in YYYY-MM-DD (America/New_York)")
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("time")
+        .setDescription("For action=schedule: time in HH:MM 24h (America/New_York)")
+        .setRequired(false)
+    )
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("Target channel (required for action=now/schedule).")
+        .setRequired(false)
+    ),
 
   new SlashCommandBuilder()
     .setName("policy")
@@ -1273,6 +1310,110 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === "intro") {
+      const action = interaction.options.getString("action", true);
+      const channel = interaction.options.getChannel("channel");
+
+      if (action === "now") {
+        const targetChannel = channel || interaction.channel;
+        if (!targetChannel) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "Could not resolve target channel."
+          }));
+          return;
+        }
+
+        try {
+          await postIntroToChannel(targetChannel.id);
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Posted intro now in <#${targetChannel.id}>.`
+          }));
+        } catch (error) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Could not post intro: ${error.message}`
+          }));
+        }
+        return;
+      }
+
+      if (action === "schedule") {
+        const date = interaction.options.getString("date");
+        const time = interaction.options.getString("time");
+        const targetChannel = channel || interaction.channel;
+
+        if (!date || !time) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:schedule`, provide both `date` (YYYY-MM-DD) and `time` (HH:MM 24h)."
+          }));
+          return;
+        }
+
+        if (!targetChannel) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:schedule`, provide a target `channel`."
+          }));
+          return;
+        }
+
+        let whenIso;
+        try {
+          whenIso = parseIntroDateTime(date, time);
+        } catch (error) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Schedule input issue: ${error.message}`
+          }));
+          return;
+        }
+
+        const armed = scheduleIntroTimer({
+          whenIso,
+          channelId: targetChannel.id,
+          scheduledBy: interaction.user.id,
+          createdAt: new Date().toISOString()
+        });
+        if (!armed) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "Scheduled time must be in the future."
+          }));
+          return;
+        }
+
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Intro scheduled for ${whenIso} (UTC) in <#${targetChannel.id}>.`
+        }));
+        return;
+      }
+
+      if (action === "status") {
+        if (!introScheduleState) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "No intro post is currently scheduled."
+          }));
+          return;
+        }
+
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Scheduled intro: ${introScheduleState.whenIso} (UTC) in <#${introScheduleState.channelId}>.`
+        }));
+        return;
+      }
+
+      if (action === "cancel") {
+        if (!introScheduleState) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "No scheduled intro to cancel."
+          }));
+          return;
+        }
+
+        clearIntroSchedule();
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "Scheduled intro canceled."
+        }));
+        return;
+      }
+    }
+
     if (interaction.commandName === "policy") {
       const chunks = splitDiscordMessage(FULL_POLICY_TEXT);
       await replyChunkedPrivatelyOrDm(
@@ -1570,8 +1711,43 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+function startHealthServer() {
+  const portRaw = process.env.PORT;
+  const port = Number.parseInt(portRaw || "0", 10);
+  if (!Number.isInteger(port) || port <= 0) {
+    return;
+  }
+
+  if (healthServer) {
+    return;
+  }
+
+  healthServer = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      const payload = {
+        status: "ok",
+        service: "sku-bot",
+        version: botVersion,
+        boot: bootIso,
+        uptimeSeconds: Math.floor(process.uptime())
+      };
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(payload));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("SKU Owl bot is running.");
+  });
+
+  healthServer.listen(port, "0.0.0.0", () => {
+    console.log(`Health server listening on port ${port}.`);
+  });
+}
+
 (async () => {
   try {
+    startHealthServer();
     await registerSlashCommands();
     await client.login(botToken);
   } catch (error) {
