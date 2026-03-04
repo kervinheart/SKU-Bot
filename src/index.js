@@ -281,6 +281,11 @@ function withPrivateVisibility(interaction, payload) {
 }
 
 async function replyPrivatelyOrDm(interaction, payload, successMessage) {
+  if (!interaction.inGuild()) {
+    await interaction.reply(payload);
+    return;
+  }
+
   try {
     await interaction.user.send(payload);
     await interaction.reply(withPrivateVisibility(interaction, {
@@ -302,6 +307,14 @@ async function replyChunked(interaction, chunks) {
 }
 
 async function replyChunkedPrivatelyOrDm(interaction, chunks, successMessage) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({ content: chunks[0] });
+    for (let index = 1; index < chunks.length; index += 1) {
+      await interaction.followUp({ content: chunks[index] });
+    }
+    return;
+  }
+
   try {
     for (const chunk of chunks) {
       await interaction.user.send({ content: chunk });
@@ -633,6 +646,11 @@ function buildGroundZeroReferencesEmbed(tier) {
 }
 
 async function replyButtonPrivatelyOrDm(interaction, payload, successMessage = "Sent to your DMs.") {
+  if (!interaction.inGuild()) {
+    await interaction.reply(payload);
+    return;
+  }
+
   try {
     await interaction.user.send(payload);
     await interaction.reply(withPrivateVisibility(interaction, { content: successMessage }));
