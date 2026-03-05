@@ -80,12 +80,15 @@ const CRISIS_LOCK_MS = 48 * 60 * 60 * 1000;
 const FALSE_FLAG_CONFIRM_MS = 5 * 60 * 1000;
 const INTRO_TZ = "America/New_York";
 const INTRO_SCHEDULE_FILE = path.resolve(process.cwd(), "data", "intro-schedule.json");
+const BROADCAST_SCHEDULE_FILE = path.resolve(process.cwd(), "data", "broadcast-schedule.json");
 const birthchartRateLimitByUser = new Map();
 const safetyLockByUser = new Map();
 const falseFlagConfirmByUser = new Map();
 const bootIso = new Date().toISOString();
 let introScheduleState = null;
 let introTimeoutHandle = null;
+let broadcastScheduleState = null;
+let broadcastTimeoutHandle = null;
 let healthServer = null;
 
 const slashCommands = [
@@ -173,6 +176,53 @@ const slashCommands = [
       option
         .setName("channel")
         .setDescription("Target channel (required for action=now/schedule).")
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("broadcast")
+    .setDescription("Send or schedule a community-wide message.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((option) =>
+      option
+        .setName("action")
+        .setDescription("What do you want to do?")
+        .addChoices(
+          { name: "now", value: "now" },
+          { name: "schedule", value: "schedule" },
+          { name: "status", value: "status" },
+          { name: "cancel", value: "cancel" }
+        )
+        .setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("message")
+        .setDescription("Message content for action=now or action=schedule.")
+        .setRequired(false)
+    )
+    .addBooleanOption((option) =>
+      option
+        .setName("mention_all")
+        .setDescription("Mention everyone with @everyone (requires permission).")
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("date")
+        .setDescription("For action=schedule: date in YYYY-MM-DD (America/New_York)")
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("time")
+        .setDescription("For action=schedule: time in HH:MM 24h (America/New_York)")
+        .setRequired(false)
+    )
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("Target channel for message post.")
         .setRequired(false)
     ),
 
@@ -618,12 +668,64 @@ function loadIntroSchedule() {
   }
 }
 
+function saveBroadcastSchedule() {
+  ensureScheduleDir();
+  if (!broadcastScheduleState) {
+    if (fs.existsSync(BROADCAST_SCHEDULE_FILE)) {
+      fs.unlinkSync(BROADCAST_SCHEDULE_FILE);
+    }
+    return;
+  }
+  fs.writeFileSync(BROADCAST_SCHEDULE_FILE, JSON.stringify(broadcastScheduleState, null, 2), "utf8");
+}
+
+function loadBroadcastSchedule() {
+  if (!fs.existsSync(BROADCAST_SCHEDULE_FILE)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(BROADCAST_SCHEDULE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.channelId || !parsed.whenIso || !parsed.message) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 async function postIntroToChannel(channelId) {
   const channel = await client.channels.fetch(channelId);
   if (!channel || typeof channel.send !== "function") {
     throw new Error("Channel is unavailable or not postable.");
   }
   await channel.send({ content: buildIntroMessage() });
+}
+
+function buildBroadcastContent(message, mentionAll) {
+  const body = (message || "").trim();
+  if (!body) {
+    throw new Error("Message cannot be empty.");
+  }
+
+  if (mentionAll) {
+    return `@everyone\n${body}`;
+  }
+
+  return body;
+}
+
+async function postBroadcastToChannel(channelId, message, mentionAll) {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || typeof channel.send !== "function") {
+    throw new Error("Channel is unavailable or not postable.");
+  }
+
+  await channel.send({
+    content: buildBroadcastContent(message, mentionAll),
+    allowedMentions: mentionAll ? { parse: ["everyone"] } : { parse: [] }
+  });
 }
 
 function clearIntroSchedule() {
@@ -633,6 +735,15 @@ function clearIntroSchedule() {
   }
   introScheduleState = null;
   saveIntroSchedule();
+}
+
+function clearBroadcastSchedule() {
+  if (broadcastTimeoutHandle) {
+    clearTimeout(broadcastTimeoutHandle);
+    broadcastTimeoutHandle = null;
+  }
+  broadcastScheduleState = null;
+  saveBroadcastSchedule();
 }
 
 function scheduleIntroTimer(schedule) {
@@ -658,6 +769,35 @@ function scheduleIntroTimer(schedule) {
       console.error("Scheduled intro post failed:", error.message);
     } finally {
       clearIntroSchedule();
+    }
+  }, delay);
+
+  return true;
+}
+
+function scheduleBroadcastTimer(schedule) {
+  if (broadcastTimeoutHandle) {
+    clearTimeout(broadcastTimeoutHandle);
+    broadcastTimeoutHandle = null;
+  }
+
+  const runAtMs = new Date(schedule.whenIso).getTime();
+  const now = Date.now();
+  const delay = runAtMs - now;
+  if (!Number.isFinite(delay) || delay <= 0) {
+    return false;
+  }
+
+  broadcastScheduleState = schedule;
+  saveBroadcastSchedule();
+  broadcastTimeoutHandle = setTimeout(async () => {
+    try {
+      await postBroadcastToChannel(schedule.channelId, schedule.message, Boolean(schedule.mentionAll));
+      console.log(`Posted scheduled broadcast to channel ${schedule.channelId} at ${new Date().toISOString()}.`);
+    } catch (error) {
+      console.error("Scheduled broadcast post failed:", error.message);
+    } finally {
+      clearBroadcastSchedule();
     }
   }, delay);
 
@@ -1072,6 +1212,16 @@ client.once(Events.ClientReady, (readyClient) => {
       clearIntroSchedule();
     }
   }
+
+  const pendingBroadcast = loadBroadcastSchedule();
+  if (pendingBroadcast) {
+    const armed = scheduleBroadcastTimer(pendingBroadcast);
+    if (armed) {
+      console.log(`Re-armed broadcast schedule for ${pendingBroadcast.whenIso} in channel ${pendingBroadcast.channelId}.`);
+    } else {
+      clearBroadcastSchedule();
+    }
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -1409,6 +1559,136 @@ client.on(Events.InteractionCreate, async (interaction) => {
         clearIntroSchedule();
         await interaction.reply(withPrivateVisibility(interaction, {
           content: "Scheduled intro canceled."
+        }));
+        return;
+      }
+    }
+
+    if (interaction.commandName === "broadcast") {
+      const action = interaction.options.getString("action", true);
+      const channel = interaction.options.getChannel("channel");
+
+      if (action === "now") {
+        const message = interaction.options.getString("message");
+        const mentionAll = interaction.options.getBoolean("mention_all") === true;
+        const targetChannel = channel || interaction.channel;
+
+        if (!message || !message.trim()) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:now`, provide `message`."
+          }));
+          return;
+        }
+
+        if (!targetChannel) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "Could not resolve target channel."
+          }));
+          return;
+        }
+
+        try {
+          await postBroadcastToChannel(targetChannel.id, message, mentionAll);
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Broadcast posted in <#${targetChannel.id}>.`
+          }));
+        } catch (error) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Could not post broadcast: ${error.message}`
+          }));
+        }
+        return;
+      }
+
+      if (action === "schedule") {
+        const message = interaction.options.getString("message");
+        const mentionAll = interaction.options.getBoolean("mention_all") === true;
+        const date = interaction.options.getString("date");
+        const time = interaction.options.getString("time");
+        const targetChannel = channel || interaction.channel;
+
+        if (!message || !message.trim()) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:schedule`, provide `message`."
+          }));
+          return;
+        }
+
+        if (!date || !time) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:schedule`, provide both `date` (YYYY-MM-DD) and `time` (HH:MM 24h)."
+          }));
+          return;
+        }
+
+        if (!targetChannel) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "For `action:schedule`, provide a target `channel`."
+          }));
+          return;
+        }
+
+        let whenIso;
+        try {
+          whenIso = parseIntroDateTime(date, time);
+        } catch (error) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: `Schedule input issue: ${error.message}`
+          }));
+          return;
+        }
+
+        const armed = scheduleBroadcastTimer({
+          whenIso,
+          channelId: targetChannel.id,
+          message: message.trim(),
+          mentionAll,
+          scheduledBy: interaction.user.id,
+          createdAt: new Date().toISOString()
+        });
+        if (!armed) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "Scheduled time must be in the future."
+          }));
+          return;
+        }
+
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: `Broadcast scheduled for ${whenIso} (UTC) in <#${targetChannel.id}>. mention_all=${mentionAll ? "true" : "false"}`
+        }));
+        return;
+      }
+
+      if (action === "status") {
+        if (!broadcastScheduleState) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "No broadcast is currently scheduled."
+          }));
+          return;
+        }
+
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: [
+            `Scheduled broadcast: ${broadcastScheduleState.whenIso} (UTC)`,
+            `Channel: <#${broadcastScheduleState.channelId}>`,
+            `mention_all: ${broadcastScheduleState.mentionAll ? "true" : "false"}`,
+            `Message preview: ${broadcastScheduleState.message.slice(0, 160)}`
+          ].join("\n")
+        }));
+        return;
+      }
+
+      if (action === "cancel") {
+        if (!broadcastScheduleState) {
+          await interaction.reply(withPrivateVisibility(interaction, {
+            content: "No scheduled broadcast to cancel."
+          }));
+          return;
+        }
+
+        clearBroadcastSchedule();
+        await interaction.reply(withPrivateVisibility(interaction, {
+          content: "Scheduled broadcast canceled."
         }));
         return;
       }
